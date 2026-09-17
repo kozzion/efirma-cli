@@ -210,9 +210,12 @@ Layout: `efirma_cli/client.py` holds all HTTP and endpoint logic,
 `efirma_cli/cli.py` is presentation only. Keep that split so the client stays
 unit-testable without spawning a subprocess.
 
-Contributions welcome. If you confirm one of the open questions in the notes,
-please update that document in the same PR — it's as much the point of this repo
-as the code is.
+Project conventions are in [AGENTS.md](AGENTS.md); it's a main-only hobby
+project, so there's deliberately very little process.
+
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). If you confirm
+one of the open questions in the notes, please update that document in the same
+change: it's as much the point of this repo as the code is.
 
 ## Scope
 

@@ -4,6 +4,11 @@ Thanks for taking a look. This is an unofficial client for a private API, so the
 most valuable contributions are usually **confirmed facts about the API**, not
 just code.
 
+This is a small, main-only hobby project — the maintainer commits straight to
+`main`. Outside contributions come as pull requests simply because that's the
+only route in; don't read it as a heavyweight process. Conventions live in
+[AGENTS.md](AGENTS.md).
+
 ## Ground rules
 
 - **Map payloads, don't guess them.** The server validates with Zod and returns
