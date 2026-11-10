@@ -12,8 +12,8 @@ office features). It drives the site's **internal** REST API — **no public API
 exists** — over plain HTTP, headlessly: no browser, no Node.
 
 The frontend is a **Nuxt 3 SPA** on Render behind Cloudflare; the API is
-**same-origin at `/api/v1`**. Auth is **JWT bearer** (`accessToken` /
-`refreshToken`), *not* cookie sessions. The full reverse-engineering writeup —
+**same-origin at `/api/v1`**. Auth is a **JWT pair handed out as cookies and
+spent as `Authorization: Bearer`**. The full reverse-engineering writeup —
 architecture, auth model, error envelope and the endpoint catalog — is in
 [docs/efirma-api-notes.md](docs/efirma-api-notes.md). Keep that doc updated as
 endpoints are confirmed.
@@ -42,6 +42,16 @@ built: expenses, contacts/items CRUD, banking.
   # -> issues: email (string, Required), password (string, Required)
   ```
 
+- **🔑 Auth tokens move in cookies, in both directions.** `POST /auth/login`
+  takes `{email, password}` in the body and answers **`204 No Content`**,
+  setting `efirma-app-access-token` / `efirma-app-refresh-token` /
+  `efirma-app-user-id`. `POST /auth/refresh` reads the refresh token **only**
+  from its cookie — sending it in the body is ignored and 401s — and rotates
+  all three. The API then accepts either cookies or the bearer header on normal
+  calls; we send only the header and keep httpx's jar empty, so a stale cookie
+  can't shadow a refreshed token. **This changed under us in 2025** (both used
+  to be JSON bodies) — if auth breaks, assume it moved again and re-probe
+  before debugging anything else.
 - **Refresh exactly like the app does.** Refresh **only** on `401` *and*
   `data.code == "invalid_access_token"`, then retry **once**. Any other 401, or
   a failed refresh, means the session is gone — don't loop. `client.py` mirrors

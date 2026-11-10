@@ -166,15 +166,26 @@ def test_error_falls_back_to_body_when_not_json():
 # -- auth ----------------------------------------------------------------
 
 
-def test_login_stores_tokens_and_sends_bearer(tmp_path):
+def _token_cookies(access: str, refresh: str, status: int = 204) -> httpx.Response:
+    """The real login/refresh reply: no body, three Set-Cookie headers."""
+    return httpx.Response(
+        status,
+        headers=[
+            ("set-cookie", f"efirma-app-access-token={access}; Path=/; HttpOnly"),
+            ("set-cookie", f"efirma-app-refresh-token={refresh}; Path=/; HttpOnly"),
+            ("set-cookie", "efirma-app-user-id=u-1; Path=/"),
+        ],
+    )
+
+
+def test_login_stores_tokens_from_cookies_and_sends_bearer(tmp_path):
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         if request.url.path.endswith("/auth/login"):
-            return httpx.Response(
-                200, json={"accessToken": "acc-1", "refreshToken": "ref-1"}
-            )
+            # 204 No Content — the tokens are in the cookies.
+            return _token_cookies("acc-1", "ref-1")
         return httpx.Response(200, json={"email": "a@b.c", "companies": []})
 
     session = tmp_path / "session.json"
@@ -185,10 +196,70 @@ def test_login_stores_tokens_and_sends_bearer(tmp_path):
     assert json.loads(session.read_text())["refreshToken"] == "ref-1"
     # 0600 — these are live credentials.
     assert session.stat().st_mode & 0o777 == 0o600
+    # Credentials go in the body; only those two fields.
+    assert json.loads(seen[0].content) == {"email": "a@b.c", "password": "pw"}
 
     client.me()
     assert seen[-1].headers["Authorization"] == "Bearer acc-1"
     assert seen[-1].headers["X-App-Locale"] == "BG"
+    # The jar is cleared after login: the bearer header is the only auth we
+    # send, so a stale cookie can never shadow a refreshed token.
+    assert "cookie" not in seen[-1].headers
+
+
+def test_login_still_accepts_tokens_in_the_body(tmp_path):
+    """efirma returned the pair as JSON until autumn 2025. Still honoured."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/login"):
+            return httpx.Response(
+                200, json={"accessToken": "acc-1", "refreshToken": "ref-1"}
+            )
+        return httpx.Response(200, json={"email": "a@b.c"})
+
+    client = _client_with(handler, session_path=tmp_path / "session.json")
+    client.login("a@b.c", "pw")
+    assert (client.access_token, client.refresh_token) == ("acc-1", "ref-1")
+
+
+def test_login_without_any_token_fails_loudly(tmp_path):
+    """A 204 with no cookies must not leave us "logged in" with None."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(204)
+
+    session = tmp_path / "session.json"
+    client = _client_with(handler, session_path=session)
+    with pytest.raises(EfirmaError, match="no access token"):
+        client.login("a@b.c", "pw")
+    assert client.access_token is None
+    assert not session.exists()  # nothing half-written
+
+
+def test_refresh_sends_the_token_as_a_cookie_not_a_body(tmp_path):
+    """The body form is ignored by the server and 401s — cookie or nothing."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return _token_cookies("acc-2", "ref-2")
+
+    session = tmp_path / "session.json"
+    session.write_text(json.dumps({"accessToken": "acc-1", "refreshToken": "ref-1"}))
+    client = _client_with(handler, session_path=session)
+    # A leftover cookie from an earlier call must not win over the one we mean
+    # to send, or we'd refresh with a token we already rotated away.
+    client._client.cookies.set("efirma-app-refresh-token", "stale")
+    client.refresh()
+
+    assert seen[0].headers["cookie"] == "efirma-app-refresh-token=ref-1"
+    assert not seen[0].content
+    # Both halves rotate, and the new pair is persisted.
+    assert (client.access_token, client.refresh_token) == ("acc-2", "ref-2")
+    assert json.loads(session.read_text()) == {
+        "accessToken": "acc-2",
+        "refreshToken": "ref-2",
+    }
 
 
 def test_expired_access_token_refreshes_and_retries_once(tmp_path):
@@ -198,9 +269,7 @@ def test_expired_access_token_refreshes_and_retries_once(tmp_path):
         path = request.url.path
         calls.append(path)
         if path.endswith("/auth/refresh"):
-            return httpx.Response(
-                200, json={"accessToken": "acc-2", "refreshToken": "ref-2"}
-            )
+            return _token_cookies("acc-2", "ref-2")
         # First /me fails with an expired token, the retry succeeds.
         if request.headers.get("Authorization") == "Bearer acc-2":
             return httpx.Response(200, json={"email": "a@b.c"})
@@ -640,3 +709,29 @@ def test_cli_invoice_create_dry_run_issues_nothing(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0
     assert posted == []  # nothing was issued
+
+
+def test_invoice_pdf_refreshes_an_expired_token_too(tmp_path):
+    """The PDF route bypassed _send once, so it alone couldn't recover a 401."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/auth/refresh"):
+            return _token_cookies("acc-2", "ref-2")
+        if request.headers.get("Authorization") == "Bearer acc-2":
+            return httpx.Response(
+                200,
+                content=b"%PDF-1.4 ...",
+                headers={"content-disposition": 'attachment; filename="F-1.pdf"'},
+            )
+        return _error_body(401, "invalid_access_token", "Invalid access token")
+
+    session = tmp_path / "session.json"
+    session.write_text(json.dumps({"accessToken": "acc-1", "refreshToken": "ref-1"}))
+    client = _client_with(handler, session_path=session)
+
+    content, name = client.invoice_pdf("c-1", "i-1")
+    assert content.startswith(b"%PDF")
+    assert name == "F-1.pdf"
+    assert calls[1].endswith("/auth/refresh")

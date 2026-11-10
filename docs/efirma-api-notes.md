@@ -42,14 +42,28 @@ The API base is therefore:
 https://app.efirma.bg/api/v1
 ```
 
-## Auth (✅ confirmed)
+## Auth (✅ confirmed — re-confirmed 2026-11-10, after it changed)
 
-**JWT bearer, not cookie sessions.**
+**Tokens are handed out as cookies and spent as a bearer token.** Credentials
+go in the body; the reply is empty.
 
 ```
 POST /api/v1/auth/login   {"email": "...", "password": "..."}
-  -> {"accessToken": "...", "refreshToken": "..."}
+  -> 204 No Content
+     set-cookie: efirma-app-access-token=<jwt>
+     set-cookie: efirma-app-refresh-token=<jwt>
+     set-cookie: efirma-app-user-id=<uuid>
 ```
+
+Both JWTs are ~176 chars and not percent-encoded. `efirma-app-user-id` is new
+and the API never asks for it back.
+
+> ⚠️ **This changed under us.** Until roughly autumn 2025 login answered `200`
+> with `{accessToken, refreshToken}` in the body, and refresh took the token in
+> the body. Both now behave as documented here. `client.py` still accepts the
+> old body shape on login, so a rollback on efirma's side wouldn't break it —
+> but this is the clearest demonstration so far that a private API is a moving
+> target. If login suddenly returns `None`, start here.
 
 Every subsequent request carries:
 
@@ -59,17 +73,32 @@ Every subsequent request carries:
 | `X-App-Locale` | `BG` or `EN` (uppercase Nuxt i18n codes, **not** IETF tags) |
 | `x-posthog-distinct-id`, `x-posthog-session-id` | analytics only — safe to omit |
 
-The browser keeps the pair in cookies `efirma-app-access-token`
-(`maxAge` 86 400 → **access token lives ~24 h**) and `efirma-app-refresh-token`
-(`maxAge` 31 536 000 → **refresh token ~1 year**), both `path=/`,
-`sameSite=lax`. We store them in `~/.efirma/session.json` (mode `0600`) instead.
+The API accepts **either** the cookie jar or the `Authorization` header — both
+were confirmed against `/me`. This client lifts the tokens out of the cookies
+and then sends only the header, clearing httpx's jar so a stale cookie can
+never shadow a freshly refreshed token.
+
+Cookie lifetimes from the bundle: `efirma-app-access-token` has `maxAge`
+86 400 (**access token ~24 h**), `efirma-app-refresh-token` has `maxAge`
+31 536 000 (**refresh token ~1 year**), both `path=/`, `sameSite=lax`. We keep
+the pair in `~/.efirma/session.json` (mode `0600`) instead.
 
 ### Refresh-and-retry (✅ confirmed)
 
+**The refresh token must travel as a cookie.** The body is ignored:
+
 ```
-POST /api/v1/auth/refresh  {"refreshToken": "..."}
-  -> {"accessToken": "...", "refreshToken": "..."}
+POST /api/v1/auth/refresh          (no body)
+  cookie: efirma-app-refresh-token=<jwt>
+  -> 204 No Content, all three cookies rotated
+
+POST /api/v1/auth/refresh  {"refreshToken": "<jwt>"}    # body form
+  -> 401 {"data": {"code": "invalid_refresh_token"}}    # silently ignored
 ```
+
+Note this endpoint is *not* a Zod oracle — a missing token is an auth failure,
+not a validation error, so `{}` returns `401 invalid_refresh_token` rather than
+a field list.
 
 The app's own rule, which `client.py` reproduces exactly: refresh **only** when
 the response is `401` **and** `data.code == "invalid_access_token"`, then retry
@@ -443,11 +472,12 @@ Confirm the API is live and see the error envelope (no auth needed):
 curl -sS https://app.efirma.bg/api/v1/companies
 ```
 
-Discover a request schema without logging in:
+Discover a request schema without logging in (`/auth/login` still validates;
+`/auth/refresh` no longer does — it 401s before Zod runs):
 
 ```bash
 curl -sS -X POST -H 'Content-Type: application/json' -d '{}' \
-  https://app.efirma.bg/api/v1/auth/refresh
+  https://app.efirma.bg/api/v1/auth/login
 ```
 
 Re-extract the endpoint catalog when the app is redeployed (the bundle hashes

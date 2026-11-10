@@ -5,13 +5,18 @@ Nuxt 3 single-page app calls from the browser (see
 ``docs/efirma-api-notes.md``). Everything is same-origin under
 ``https://app.efirma.bg/api/v1`` — there is no separate API host.
 
-Auth is **JWT bearer**, not cookies-as-session: ``POST /auth/login`` returns
-``{accessToken, refreshToken}``, the access token goes out as
-``Authorization: Bearer <token>``, and a 401 carrying
-``data.code == "invalid_access_token"`` is the signal to call
-``POST /auth/refresh`` and retry once. The browser stores the pair in the
-``efirma-app-access-token`` / ``efirma-app-refresh-token`` cookies; we store
-them in a JSON file instead.
+Auth is a JWT pair handed out as **cookies** and spent as a **bearer token**.
+``POST /auth/login`` takes ``{email, password}`` in the body and answers
+``204 No Content``, setting ``efirma-app-access-token``,
+``efirma-app-refresh-token`` and ``efirma-app-user-id``. We lift the pair out
+of those cookies, store it in a JSON file, and send the access token as
+``Authorization: Bearer <token>`` — the API accepts either, and the header
+keeps one source of truth instead of two.
+
+A 401 carrying ``data.code == "invalid_access_token"`` is the signal to call
+``POST /auth/refresh`` and retry once. Refresh reads the refresh token *only*
+from its cookie — passing it in the body is ignored and answers 401
+``invalid_refresh_token`` — and rotates all three cookies.
 
 This module is deliberately free of any CLI / presentation concerns so the
 logic can be unit-tested without spawning a subprocess.
@@ -38,6 +43,13 @@ LOCALE_HEADER = "X-App-Locale"
 # expired. It is the *only* 401 that should trigger a refresh-and-retry; other
 # 401s (bad refresh token, revoked session) mean the login is genuinely gone.
 INVALID_ACCESS_TOKEN = "invalid_access_token"
+
+# Auth tokens travel as cookies in both directions. Login and refresh set
+# these; refresh also *reads* the refresh token from its cookie and nowhere
+# else. (A third cookie, ``efirma-app-user-id``, is set too — the API doesn't
+# need it back, so we don't keep it.)
+ACCESS_COOKIE = "efirma-app-access-token"
+REFRESH_COOKIE = "efirma-app-refresh-token"
 
 
 def default_session_path() -> Path:
@@ -438,9 +450,14 @@ class EfirmaClient:
             headers["Authorization"] = f"Bearer {self.access_token}"
         return headers
 
-    def _request(
+    def _send(
         self, method: str, path: str, *, _retry: bool = True, **kwargs: Any
-    ) -> Any:
+    ) -> httpx.Response:
+        """Make a request, raising :class:`EfirmaError` on any 4xx/5xx.
+
+        Returns the raw response rather than decoded JSON, because the auth
+        endpoints answer ``204`` and put everything that matters in cookies.
+        """
         headers = {**self._headers(), **kwargs.pop("headers", {})}
         try:
             response = self._client.request(method, path, headers=headers, **kwargs)
@@ -458,9 +475,15 @@ class EfirmaClient:
                 and self.refresh_token
             ):
                 self.refresh()
-                return self._request(method, path, _retry=False, **kwargs)
+                return self._send(method, path, _retry=False, **kwargs)
             raise error
 
+        return response
+
+    def _request(
+        self, method: str, path: str, *, _retry: bool = True, **kwargs: Any
+    ) -> Any:
+        response = self._send(method, path, _retry=_retry, **kwargs)
         if response.status_code == 204 or not response.content:
             return None
         try:
@@ -492,33 +515,78 @@ class EfirmaClient:
         """Authenticate and store the resulting JWT pair.
 
         The password is sent straight to efirma and never stored by this
-        client; only the returned tokens are persisted.
+        client; only the returned tokens are persisted. The response is a bare
+        ``204`` — the tokens come back as cookies.
         """
-        tokens = self.post("/auth/login", {"email": email, "password": password})
-        return self._store_tokens(tokens)
+        response = self._send(
+            "POST",
+            "/auth/login",
+            _retry=False,
+            json={"email": email, "password": password},
+        )
+        return self._store_tokens(response)
 
     def refresh(self) -> dict[str, Any]:
         """Exchange the refresh token for a fresh pair.
 
-        Called automatically by :meth:`_request` when the access token expires,
+        Called automatically by :meth:`_send` when the access token expires,
         so callers rarely need this directly.
+
+        The token must go out as a **cookie**. Sending it in the body — which
+        is what this client did until efirma changed the endpoint — is
+        ignored, and the call fails with 401 ``invalid_refresh_token``.
         """
         if not self.refresh_token:
             raise EfirmaError("not logged in: no refresh token stored")
-        # Bypass _request's retry path — a failure here is terminal.
-        tokens = self._request(
+        # Written as a header rather than passed as ``cookies=``: httpx
+        # deprecates per-request cookies. Emptying the jar first stops httpx
+        # overwriting the header with whatever it has stored.
+        self._client.cookies.clear()
+        # Bypass the retry path — a failure here is terminal.
+        response = self._send(
             "POST",
             "/auth/refresh",
             _retry=False,
-            json={"refreshToken": self.refresh_token},
+            headers={"Cookie": f"{REFRESH_COOKIE}={self.refresh_token}"},
         )
-        return self._store_tokens(tokens)
+        return self._store_tokens(response)
 
-    def _store_tokens(self, tokens: Any) -> dict[str, Any]:
-        if not isinstance(tokens, dict) or not tokens.get("accessToken"):
-            raise EfirmaError(f"unexpected auth response: {tokens!r}")
+    def _store_tokens(self, response: httpx.Response) -> dict[str, Any]:
+        """Lift the JWT pair out of an auth response and persist it.
+
+        Cookies first, then a JSON body: efirma returned the pair in the body
+        until autumn 2025, and accepting both costs one ``get`` and means a
+        rollback on their side doesn't break this client.
+        """
+        tokens = {
+            "accessToken": response.cookies.get(ACCESS_COOKIE),
+            "refreshToken": response.cookies.get(REFRESH_COOKIE),
+        }
+        if not tokens["accessToken"] and response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                tokens = {
+                    "accessToken": body.get("accessToken"),
+                    "refreshToken": body.get("refreshToken"),
+                }
+
+        if not tokens["accessToken"]:
+            # Never interpolate the response itself — it may carry a token.
+            raise EfirmaError(
+                "no access token in the auth response: "
+                f"{response.status_code}, cookies "
+                f"{sorted(response.cookies.keys()) or 'none'}"
+            )
+
         self.access_token = tokens["accessToken"]
-        self.refresh_token = tokens.get("refreshToken") or self.refresh_token
+        self.refresh_token = tokens["refreshToken"] or self.refresh_token
+        # Keep the Authorization header the single source of truth. httpx has
+        # just stashed the same cookies in the client jar, and after a refresh
+        # rotates the pair a stale one could shadow the new bearer token.
+        self._client.cookies.clear()
         self._save_tokens()
         return tokens
 
@@ -706,12 +774,11 @@ class EfirmaClient:
 
         The real filename is in ``Content-Disposition`` — read it rather than
         inventing one from the id.
+
+        Goes through :meth:`_send` rather than :meth:`get` because the body is
+        a PDF, not JSON — but it still gets the refresh-and-retry that every
+        other call has.
         """
         path = f"/companies/{company_id}/invoices/{invoice_id}/pdf"
-        try:
-            response = self._client.get(path, headers=self._headers())
-        except httpx.HTTPError as exc:
-            raise EfirmaError(f"request to {path} failed: {exc}") from exc
-        if response.status_code >= 400:
-            raise EfirmaError.from_response(response)
+        response = self._send("GET", path)
         return response.content, filename_from_headers(response.headers, invoice_id)

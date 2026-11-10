@@ -157,10 +157,23 @@ curl -sS -X POST -H 'Content-Type: application/json' -d '{}' \
 Every payload this client sends was mapped that way rather than guessed. If you
 extend it, do the same before writing code.
 
-**Auth is JWT bearer, not cookie sessions.** `POST /auth/login` returns
-`{accessToken, refreshToken}`. The refresh rule is specific and worth copying
-exactly: refresh **only** on `401` *and* `data.code == "invalid_access_token"`,
-then retry once. Any other 401 means the session is genuinely gone — don't loop.
+**Tokens arrive as cookies and are spent as a bearer token.** `POST
+/auth/login` takes the credentials in the body and answers `204 No Content`,
+setting `efirma-app-access-token` and `efirma-app-refresh-token`. The API then
+accepts either the cookies or `Authorization: Bearer`. Refresh is the asymmetric
+one: it reads the token **only** from the cookie, and passing it in the body —
+which used to be the documented way — is ignored and 401s.
+
+The refresh rule itself is worth copying exactly: refresh **only** on `401`
+*and* `data.code == "invalid_access_token"`, then retry once. Any other 401
+means the session is genuinely gone — don't loop.
+
+**And it moved.** Until autumn 2025 login returned `{accessToken, refreshToken}`
+as JSON and refresh took the token in the body. Both changed with no notice and
+no version bump, which broke this client until it was spotted. That is the real
+lesson of the exercise, and the reason for the disclaimer at the top: a private
+API has no contract. The client still accepts the old login shape, so a
+rollback on their side doesn't break it either.
 
 **A `200` does not mean the endpoint exists.** The SPA serves its HTML shell for
 every unmatched path, so `/openapi.json`, `/api/docs` and friends all return
