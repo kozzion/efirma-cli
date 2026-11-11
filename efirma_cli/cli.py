@@ -17,12 +17,15 @@ from rich.console import Console
 from rich.table import Table
 
 from efirma_cli.client import (
+    CONTACT_TYPES,
     INVOICE_STATUSES,
     PAYMENT_METHODS,
     TAX_METHODS,
     EfirmaClient,
     EfirmaError,
+    build_contact_payload,
     build_invoice_payload,
+    build_item_payload,
     build_line_item,
     default_session_path,
     invoice_total,
@@ -56,6 +59,14 @@ app.add_typer(users_app, name="users")
 invoices_app = typer.Typer(help="Read and issue invoices.", no_args_is_help=True)
 app.add_typer(invoices_app, name="invoices")
 
+contacts_app = typer.Typer(
+    help="Read and create contacts (customers and suppliers).", no_args_is_help=True
+)
+app.add_typer(contacts_app, name="contacts")
+
+items_app = typer.Typer(help="Read and create catalog items.", no_args_is_help=True)
+app.add_typer(items_app, name="items")
+
 console = Console()
 err_console = Console(stderr=True)
 
@@ -70,6 +81,15 @@ CompanyOpt = typer.Option(
     "Defaults to $EFIRMA_COMPANY, else the selected company.",
 )
 JsonOpt = typer.Option(False, "--json", help="Emit raw JSON instead of a table.")
+TypeOpt = typer.Option(
+    ["CUSTOMER"],
+    "--type",
+    "-t",
+    help=f"Repeatable. One or both of: {', '.join(CONTACT_TYPES)}.",
+)
+DryRunOpt = typer.Option(
+    False, "--dry-run", help="Print the payload and exit without creating anything."
+)
 LineOpt = typer.Option(
     None,
     "--line",
@@ -653,6 +673,216 @@ def invoices_create(
         except (OSError, ValueError) as exc:
             _fail(f"could not read payload: {exc}")
     console.print(f"[green]issued[/] {created.get('displayNumber', '')}")
+
+
+# -- contacts --------------------------------------------------------------
+
+
+@contacts_app.command("list")
+def contacts_list(
+    page: int = typer.Option(1, "--page", help="Page number (1-based)."),
+    company: str = CompanyOpt,
+    as_json: bool = JsonOpt,
+    locale: str = LocaleOpt,
+) -> None:
+    """List customers and suppliers."""
+    with _client(locale) as client:
+        try:
+            target = _resolve_company(client, company)
+            data = client.contacts(target["id"], page=page)
+        except EfirmaError as exc:
+            _fail(str(exc))
+    if as_json:
+        _echo_json(data)
+        return
+    rows = unwrap(data)
+    table = Table(title=f"Contacts — {localized(target, locale=locale)}")
+    for column in ("Name", "Type", "Email", "UIC", "VAT", "Country", "ID"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(
+            str(row.get("name") or ""),
+            ", ".join(row.get("type") or []),
+            str(row.get("email") or ""),
+            str(row.get("uic") or ""),
+            str(row.get("vat") or ""),
+            str(row.get("countryCode") or ""),
+            str(row.get("id") or ""),
+        )
+    console.print(table)
+    if not rows:
+        console.print("[dim]no contacts yet — create one with `contacts create`[/]")
+
+
+@contacts_app.command("create")
+def contacts_create(
+    name: str = typer.Argument(..., help="Contact name (not bilingual here)."),
+    types: list[str] = TypeOpt,
+    email: str = typer.Option("", "--email", help="Must be a valid address, or blank."),
+    country: str = typer.Option(
+        "BG", "--country", help="ISO 3166-1 alpha-2, e.g. BG, GB, DE."
+    ),
+    currency: str = typer.Option(
+        None, "--currency", help="Default currency. Defaults to the company's."
+    ),
+    uic: str = typer.Option(None, "--uic", help="Company registration number (EIK)."),
+    vat: str = typer.Option(None, "--vat", help="VAT number, e.g. BG123456789."),
+    notes: str = typer.Option(None, "--notes", help="Free-text note."),
+    city: str = typer.Option(None, "--city"),
+    line1: str = typer.Option(None, "--line1", help="Street address."),
+    line2: str = typer.Option(None, "--line2"),
+    state: str = typer.Option(None, "--state"),
+    municipality: str = typer.Option(None, "--municipality"),
+    postcode: str = typer.Option(None, "--postcode"),
+    phone: str = typer.Option(None, "--phone"),
+    attention: str = typer.Option(None, "--attention", help="'For the attention of'."),
+    address_locale: str = typer.Option(
+        None,
+        "--address-locale",
+        help="Which half of the bilingual address fields to fill. "
+        "Defaults to --locale.",
+    ),
+    invoice_locale: str = typer.Option(
+        None,
+        "--invoice-locale",
+        help="Language for documents sent to this contact: BG or EN.",
+    ),
+    dry_run: bool = DryRunOpt,
+    company: str = CompanyOpt,
+    locale: str = LocaleOpt,
+) -> None:
+    """Create a customer or supplier.
+
+    A contact is ordinary company data — editable and deletable afterwards,
+    unlike an invoice — so this doesn't prompt. Use --dry-run to see the
+    payload first.
+
+    The address fields are bilingual on the server; --address-locale picks
+    which half they go into.
+    """
+    with _client(locale) as client:
+        try:
+            target = _resolve_company(client, company)
+            payload = build_contact_payload(
+                name=name,
+                types=types,
+                email=email,
+                country_code=country,
+                currency_code=currency or target.get("baseCurrencyCode") or "EUR",
+                uic=uic,
+                vat=vat,
+                notes=notes,
+                city=city,
+                line1=line1,
+                line2=line2,
+                state=state,
+                municipality=municipality,
+                postal_code=postcode,
+                phone=phone,
+                attention=attention,
+                address_locale=(address_locale or locale).upper(),
+                locale=invoice_locale.upper() if invoice_locale else None,
+            )
+            if dry_run:
+                _echo_json(payload)
+                console.print("[dim]dry run — nothing was created[/]")
+                raise typer.Exit()
+            created = client.create_contact(target["id"], payload)
+        except EfirmaError as exc:
+            _fail(str(exc))
+    console.print(
+        f"[green]created[/] contact {created.get('name', name)} "
+        f"[dim]{created.get('id', '')}[/]"
+    )
+
+
+# -- items -----------------------------------------------------------------
+
+
+@items_app.command("list")
+def items_list(
+    page: int = typer.Option(1, "--page", help="Page number (1-based)."),
+    company: str = CompanyOpt,
+    as_json: bool = JsonOpt,
+    locale: str = LocaleOpt,
+) -> None:
+    """List catalog items."""
+    with _client(locale) as client:
+        try:
+            target = _resolve_company(client, company)
+            data = client.items(target["id"], page=page)
+        except EfirmaError as exc:
+            _fail(str(exc))
+    if as_json:
+        _echo_json(data)
+        return
+    rows = unwrap(data)
+    table = Table(title=f"Items — {localized(target, locale=locale)}")
+    for column in ("Name", "Unit price", "Unit", "Account", "Active", "ID"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(
+            localized(row, locale=locale),
+            f"{row.get('unitPrice', 0):,.2f}",
+            localized(row.get("unit") or {}, locale=locale),
+            localized(row.get("account") or {}, locale=locale),
+            "✓" if row.get("active") else "",
+            str(row.get("id") or ""),
+        )
+    console.print(table)
+    if not rows:
+        console.print("[dim]no items yet — create one with `items create`[/]")
+
+
+@items_app.command("create")
+def items_create(
+    name: str = typer.Argument(..., help="Item name, in Bulgarian (name_bg)."),
+    price: float = typer.Option(..., "--price", help="Unit price, excluding VAT."),
+    unit: str = typer.Option(..., "--unit", help="Unit UUID or name (e.g. 'hr')."),
+    account: str = typer.Option(..., "--account", help="Account UUID or name."),
+    name_en: str = typer.Option(
+        None, "--name-en", help="English name. Defaults to the Bulgarian one."
+    ),
+    inactive: bool = typer.Option(False, "--inactive", help="Create it deactivated."),
+    dry_run: bool = DryRunOpt,
+    company: str = CompanyOpt,
+    locale: str = LocaleOpt,
+) -> None:
+    """Create a catalog item.
+
+    Every invoice line has to point at one of these, plus a unit and an
+    account — see `efirma invoices refs` for what already exists.
+    """
+    with _client(locale) as client:
+        try:
+            target = _resolve_company(client, company)
+            cid = target["id"]
+            chosen_unit = _pick(client.units(cid), unit, "unit", locale)
+            chosen_account = _pick(client.accounts(cid), account, "account", locale)
+            payload = build_item_payload(
+                name_bg=name,
+                name_en=name_en,
+                unit_price=price,
+                unit_id=chosen_unit["id"],
+                account_id=chosen_account["id"],
+                active=not inactive,
+            )
+            console.print(
+                f"[bold]{name}[/] @ {price:,.2f} per "
+                f"{localized(chosen_unit, locale=locale)} → "
+                f"{localized(chosen_account, locale=locale)}"
+            )
+            if dry_run:
+                _echo_json(payload)
+                console.print("[dim]dry run — nothing was created[/]")
+                raise typer.Exit()
+            created = client.create_item(cid, payload)
+        except EfirmaError as exc:
+            _fail(str(exc))
+    console.print(
+        f"[green]created[/] item {localized(created, locale=locale) or name} "
+        f"[dim]{created.get('id', '')}[/]"
+    )
 
 
 def main() -> None:

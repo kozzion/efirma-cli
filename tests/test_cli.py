@@ -17,7 +17,9 @@ from efirma_cli.client import (
     DEFAULT_BASE_URL,
     EfirmaClient,
     EfirmaError,
+    build_contact_payload,
     build_invoice_payload,
+    build_item_payload,
     build_line_item,
     company_matches,
     display_number,
@@ -735,3 +737,293 @@ def test_invoice_pdf_refreshes_an_expired_token_too(tmp_path):
     assert content.startswith(b"%PDF")
     assert name == "F-1.pdf"
     assert calls[1].endswith("/auth/refresh")
+
+
+# -- contacts & items -----------------------------------------------------
+
+
+def test_contact_payload_has_the_seven_required_keys():
+    payload = build_contact_payload(name="Acme Ltd", country_code="GB")
+    # All seven must be present; address/settings may be empty but not absent.
+    assert set(payload) == {
+        "type",
+        "name",
+        "email",
+        "countryCode",
+        "defaultCurrencyCode",
+        "address",
+        "settings",
+    }
+    assert payload["type"] == ["CUSTOMER"]
+    assert payload["email"] == ""  # "" is valid; absent is not
+    assert payload["settings"] == {}
+    # The country is echoed into the nested address too.
+    assert payload["address"] == {"country": "GB"}
+
+
+def test_contact_name_is_not_bilingual():
+    """Contacts are the exception: a plain `name`, no name_bg/name_en."""
+    payload = build_contact_payload(name="Acme Ltd", country_code="GB")
+    assert payload["name"] == "Acme Ltd"
+    assert "name_bg" not in payload and "name_en" not in payload
+
+
+def test_contact_country_code_is_normalised_and_checked():
+    assert build_contact_payload(name="x", country_code="gb")["countryCode"] == "GB"
+    for bad in ("GBR", "G", "G1"):
+        with pytest.raises(EfirmaError, match="alpha-2"):
+            build_contact_payload(name="x", country_code=bad)
+
+
+def test_contact_address_locale_picks_the_half_to_fill():
+    en = build_contact_payload(
+        name="x", country_code="GB", city="London", line1="1 St", address_locale="EN"
+    )
+    assert en["address"]["city_en"] == "London"
+    assert "city_bg" not in en["address"]
+
+    bg = build_contact_payload(
+        name="x",
+        country_code="BG",
+        uic="123456789",
+        city="София",
+        address_locale="BG",
+    )
+    assert bg["address"]["city_bg"] == "София"
+    assert "city_en" not in bg["address"]
+
+
+def test_bulgarian_contact_requires_a_uic():
+    """Conditional rule: BG only. The server just says 'Invalid input'."""
+    with pytest.raises(EfirmaError, match="needs --uic"):
+        build_contact_payload(name="Тест", country_code="BG")
+    # Any other country is fine without one.
+    assert "uic" not in build_contact_payload(name="x", country_code="GB")
+
+
+@pytest.mark.parametrize("uic", ["123456789", "1234567890", "1234567890123"])
+def test_valid_bulgarian_identifier_lengths(uic):
+    payload = build_contact_payload(name="Тест", country_code="BG", uic=uic)
+    assert payload["uic"] == uic
+
+
+@pytest.mark.parametrize("uic", ["12345678", "12345678901", "abcdefghi", "12345678a"])
+def test_invalid_bulgarian_identifier_lengths(uic):
+    with pytest.raises(EfirmaError, match="not a valid Bulgarian identifier"):
+        build_contact_payload(name="Тест", country_code="BG", uic=uic)
+
+
+def test_contact_type_must_be_known():
+    with pytest.raises(EfirmaError, match="unknown contact type"):
+        build_contact_payload(name="x", country_code="GB", types=["PARTNER"])
+    both = build_contact_payload(
+        name="x", country_code="GB", types=["CUSTOMER", "SUPPLIER"]
+    )
+    assert both["type"] == ["CUSTOMER", "SUPPLIER"]
+
+
+def test_item_payload_defaults_english_name_to_the_bulgarian_one():
+    payload = build_item_payload(
+        name_bg="Консултация", unit_price=150.0, unit_id="u-1", account_id="a-1"
+    )
+    assert payload["name_en"] == "Консултация"
+    assert payload == {
+        "name_bg": "Консултация",
+        "name_en": "Консултация",
+        "unitPrice": 150.0,
+        "unitId": "u-1",
+        "accountId": "a-1",
+        "active": True,
+    }
+
+
+def test_item_rejects_a_negative_price():
+    with pytest.raises(EfirmaError, match="negative"):
+        build_item_payload(name_bg="x", unit_price=-1, unit_id="u", account_id="a")
+
+
+def test_zod_errors_in_the_message_string_are_parsed():
+    """Current builds serialise the ZodError array into `message`."""
+    response = httpx.Response(
+        400,
+        json={
+            "error": True,
+            "statusCode": 400,
+            "statusMessage": "Validation Error",
+            "message": json.dumps(
+                [
+                    {
+                        "code": "invalid_format",
+                        "path": ["email"],
+                        "message": "Invalid email address",
+                    },
+                    {"code": "custom", "path": ["uic"], "message": "Invalid input"},
+                ]
+            ),
+        },
+    )
+    err = EfirmaError.from_response(response)
+    assert "email: Invalid email address" in str(err)
+    assert "uic: Invalid input" in str(err)
+    assert len(err.issues) == 2
+
+
+def test_union_errors_report_the_branches_not_the_parent():
+    """A union's parent only says 'Invalid input'; the branches are the news."""
+    response = httpx.Response(
+        400,
+        json={
+            "message": json.dumps(
+                [
+                    {
+                        "code": "invalid_union",
+                        "path": ["email"],
+                        "message": "Invalid input",
+                        "errors": [
+                            [
+                                {
+                                    "code": "invalid_type",
+                                    "path": [],
+                                    "message": "expected string",
+                                }
+                            ],
+                            [
+                                {
+                                    "code": "invalid_value",
+                                    "path": [],
+                                    "message": 'expected ""',
+                                }
+                            ],
+                        ],
+                    }
+                ]
+            )
+        },
+    )
+    err = EfirmaError.from_response(response)
+    assert "email: expected string" in str(err)
+    assert 'email: expected ""' in str(err)
+    assert "Invalid input" not in str(err)
+
+
+def test_reference_not_found_still_comes_from_data_issues():
+    """The post-schema reference check uses the older envelope."""
+    response = httpx.Response(
+        400,
+        json={
+            "message": "Validation Error",
+            "data": {
+                "code": "reference_not_found",
+                "issues": [
+                    {
+                        "code": "custom",
+                        "path": ["unitId"],
+                        "message": "Not found in this company",
+                    }
+                ],
+            },
+        },
+    )
+    err = EfirmaError.from_response(response)
+    assert err.code == "reference_not_found"
+    assert "unitId: Not found in this company" in str(err)
+
+
+def _cli_env(tmp_path, monkeypatch, handler):
+    session = tmp_path / "session.json"
+    session.write_text(json.dumps({"accessToken": "a", "refreshToken": "r"}))
+    monkeypatch.setenv("EFIRMA_SESSION_FILE", str(session))
+    monkeypatch.setenv("EFIRMA_COMPANY", COMPANY["uic"])
+    monkeypatch.setattr(
+        "efirma_cli.cli._client",
+        lambda locale="BG": _client_with(handler, session_path=session),
+    )
+
+
+def test_cli_contacts_create_dry_run_posts_nothing(tmp_path, monkeypatch):
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posted.append(str(request.url))
+        return httpx.Response(200, json={"companies": [COMPANY]})
+
+    _cli_env(tmp_path, monkeypatch, handler)
+    result = runner.invoke(
+        app,
+        ["contacts", "create", "Kyra Law Ltd", "--country", "GB", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert posted == []
+
+
+def test_cli_items_create_dry_run_posts_nothing(tmp_path, monkeypatch):
+    posted: list[str] = []
+    unit = {"id": "u-1", "name_bg": "час", "name_en": "hr"}
+    account = {"id": "a-1", "name_bg": "Услуги", "name_en": "Services"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posted.append(str(request.url))
+        path = request.url.path
+        if path.endswith("/units"):
+            return httpx.Response(200, json=[unit])
+        if path.endswith("/accounts"):
+            return httpx.Response(200, json=[account])
+        return httpx.Response(200, json={"companies": [COMPANY]})
+
+    _cli_env(tmp_path, monkeypatch, handler)
+    result = runner.invoke(
+        app,
+        [
+            "items",
+            "create",
+            "Консултация",
+            "--price",
+            "150",
+            "--unit",
+            "hr",
+            "--account",
+            "Services",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    assert posted == []
+
+
+def test_cli_contacts_create_posts_the_payload(tmp_path, monkeypatch):
+    sent: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/contacts"):
+            body = json.loads(request.content)
+            sent.append(body)
+            return httpx.Response(201, json={**body, "id": "new-1"})
+        return httpx.Response(200, json={"companies": [COMPANY]})
+
+    _cli_env(tmp_path, monkeypatch, handler)
+    result = runner.invoke(
+        app,
+        [
+            "contacts",
+            "create",
+            "Kyra Law Ltd",
+            "--country",
+            "GB",
+            "--email",
+            "billing@example.com",
+            "--city",
+            "London",
+            "--invoice-locale",
+            "EN",
+            "--address-locale",
+            "EN",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(sent) == 1
+    assert sent[0]["name"] == "Kyra Law Ltd"
+    assert sent[0]["address"]["city_en"] == "London"
+    assert sent[0]["settings"]["locale"] == "EN"
+    assert "new-1" in result.output

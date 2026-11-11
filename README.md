@@ -64,6 +64,10 @@ access token expires.
 | `efirma invoices pdf <id>` | Download an invoice PDF |
 | `efirma invoices refs` | Show the contacts/items/units/accounts invoicing needs |
 | `efirma invoices create` | Issue an invoice (asks first) |
+| `efirma contacts list` | List customers and suppliers |
+| `efirma contacts create <name>` | Create a customer or supplier |
+| `efirma items list` | List catalog items |
+| `efirma items create <name>` | Create a catalog item |
 
 Add `--json` to most commands for raw JSON instead of a table, and `--locale EN`
 to render names in English.
@@ -88,6 +92,20 @@ but no items and no contacts, so check what exists first:
 ```bash
 poetry run efirma invoices refs
 ```
+
+Create whatever is missing. Both commands take `--dry-run` to print the payload
+without sending it:
+
+```bash
+poetry run efirma contacts create "Example Ltd" --country GB --currency GBP \
+  --email billing@example.com --city London --line1 "1 Example Street"
+
+poetry run efirma items create "Консултантски услуги" \
+  --name-en "Consulting services" --price 150 --unit hr --account "Sale of services"
+```
+
+A **Bulgarian** contact additionally needs `--uic` — an EIK (9 digits), an ЕГН
+(10) or a branch EIK (13). Contacts in other countries don't.
 
 Then build one from flags:
 
@@ -193,6 +211,19 @@ blank column, which is exactly the bug the first live run produced. Hence the
 `/items`) return a paginated envelope `{data, count, pagination, order,
 filters}`. Hence `unwrap()`.
 
+**Unknown keys are silently stripped, which makes a wrong guess look right.**
+`{"street": "..."}` on a contact address vanishes without a word — the real key
+is `line1_bg`/`line1_en`. To tell a real field from an imaginary one, send the
+*wrong type* and see which ones complain. Sweeping a list of candidate names
+that way enumerates the whole schema.
+
+**Conditional rules hide behind an invalid field.** Probing a create endpoint
+without creating anything means keeping one field deliberately invalid — but
+refinements that depend on another field don't run while that field is
+failing. The contact schema never mentioned its Bulgaria-only `uic`
+requirement until the poison pill moved off `type`. If a payload validates in
+probing and fails for real, that's the reason.
+
 **Some fields are nullable but still required.** On invoice create,
 `vatNonChargeReasonId` and `bankAccountId` are reported `Required` when *absent*
 but accept an explicit `null`. Omitting the key is an error; sending `null` is
@@ -204,9 +235,10 @@ Verified against a live account: login/refresh/logout, `/me`, company listing
 and resolution, the full users surface, and invoice reading. Invoice *issuing*
 is built and schema-confirmed but unexercised (see the warning above).
 
-Not built yet — endpoints are catalogued in the notes, payloads unmapped:
-contacts and items CRUD, expenses, credit/debit notes, recurring invoices,
-banking and bank-transaction matching, exports.
+Contacts and items can be listed and created; update and delete are not built.
+Not built at all — endpoints are catalogued in the notes, payloads unmapped:
+expenses, credit/debit notes, recurring invoices, banking and bank-transaction
+matching, exports.
 
 ## Development
 

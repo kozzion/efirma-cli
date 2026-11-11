@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -73,8 +74,14 @@ class EfirmaError(RuntimeError):
          "message": "Invalid access token",
          "data": {"code": "invalid_access_token", "message": ...}}
 
-    Validation failures (Zod, on the server) put the field errors in
-    ``data.issues`` instead, with ``data.name == "ZodError"``.
+    Validation failures come in **two** shapes, and you meet both:
+
+    * Zod schema errors serialise the raw ``ZodError`` array into ``message``
+      as a **JSON string** (older builds used ``data.issues`` with
+      ``data.name == "ZodError"``; both are handled).
+    * Reference checks that run *after* the schema passes — an id that isn't
+      in this company — use ``data.issues`` with
+      ``data.code == "reference_not_found"``.
     """
 
     def __init__(
@@ -89,6 +96,46 @@ class EfirmaError(RuntimeError):
         self.status_code = status_code
         self.code = code
         self.issues = issues or []
+
+    @staticmethod
+    def _issues(body: dict[str, Any]) -> list[dict[str, Any]]:
+        """Flatten the field errors out of whichever envelope this build uses.
+
+        ``data.issues`` if present, else a JSON-encoded ZodError array in
+        ``message``. Union errors nest their branches under ``errors``; the
+        parent only ever says "Invalid input", so the branches replace it —
+        they are the ones that name the expected type.
+        """
+        data = body.get("data")
+        raw: Any = data.get("issues") if isinstance(data, dict) else None
+        if not raw:
+            message = body.get("message")
+            if isinstance(message, str) and message.lstrip().startswith("["):
+                try:
+                    raw = json.loads(message)
+                except ValueError:
+                    raw = None
+
+        flat: list[dict[str, Any]] = []
+
+        def walk(items: Any, prefix: list[Any]) -> None:
+            if not isinstance(items, list):
+                return
+            for issue in items:
+                if isinstance(issue, list):
+                    walk(issue, prefix)
+                    continue
+                if not isinstance(issue, dict):
+                    continue
+                path = prefix + list(issue.get("path") or [])
+                branches = issue.get("errors")
+                if branches:
+                    walk(branches, path)
+                else:
+                    flat.append({**issue, "path": path})
+
+        walk(raw, [])
+        return flat
 
     @classmethod
     def from_response(cls, response: httpx.Response) -> EfirmaError:
@@ -108,13 +155,15 @@ class EfirmaError(RuntimeError):
             )
 
         data = body.get("data") or {}
-        issues = data.get("issues") if isinstance(data, dict) else None
+        issues = cls._issues(body)
         if issues:
-            detail = "; ".join(
-                f"{'.'.join(str(p) for p in i.get('path', []))}: {i.get('message')}"
-                for i in issues
-            )
-            message = f"validation failed: {detail}"
+            seen: list[str] = []
+            for issue in issues:
+                path = ".".join(str(p) for p in issue.get("path") or []) or "(root)"
+                line = f"{path}: {issue.get('message')}"
+                if line not in seen:
+                    seen.append(line)
+            message = "validation failed: " + "; ".join(seen)
         else:
             message = (
                 body.get("message") or body.get("statusMessage") or response.text[:200]
@@ -194,6 +243,15 @@ PAYMENT_METHODS = (
     "OTHER",
 )
 TAX_METHODS = ("NO_TAX", "PER_LINE", "PER_TOTAL")
+
+# A contact is a customer, a supplier, or both — the field is an array.
+CONTACT_TYPES = ("CUSTOMER", "SUPPLIER")
+
+# A Bulgarian contact must carry an identifier, and only these lengths are
+# accepted: 9 = EIK (legal entity), 10 = ЕГН (a person or sole trader),
+# 13 = EIK of a branch. Digits only, and no checksum is applied — 999999999
+# validates. Contacts in any other country don't need one at all.
+BG_UIC_LENGTHS = (9, 10, 13)
 DOCUMENT_TYPES = (
     "INVOICE",
     "PROFORMA_INVOICE",
@@ -251,6 +309,137 @@ def display_number(prefix: str, number: int) -> str:
     override with an explicit ``display_number`` if it turns out different.
     """
     return f"{prefix}{str(number).zfill(max(DISPLAY_NUMBER_WIDTH - len(prefix), 1))}"
+
+
+def build_contact_payload(
+    *,
+    name: str,
+    types: Sequence[str] = ("CUSTOMER",),
+    email: str = "",
+    country_code: str = "BG",
+    currency_code: str = "EUR",
+    uic: str | None = None,
+    vat: str | None = None,
+    notes: str | None = None,
+    city: str | None = None,
+    line1: str | None = None,
+    line2: str | None = None,
+    state: str | None = None,
+    municipality: str | None = None,
+    postal_code: str | None = None,
+    phone: str | None = None,
+    attention: str | None = None,
+    address_locale: str = "EN",
+    locale: str | None = None,
+    vat_non_charge_reason_id: str | None = None,
+) -> dict[str, Any]:
+    """Assemble a contact payload. Pure function — no network.
+
+    Seven keys are required, but three of them tolerate a blank: ``email``
+    accepts ``""`` (and *only* a valid address otherwise), while ``address``
+    and ``settings`` accept ``{}``. They must still be present.
+
+    Note the name is **not** bilingual here — contacts have a plain ``name``,
+    unlike almost everything else in this API. The *address* is bilingual, so
+    ``address_locale`` picks which half the given city/street land in.
+
+    ``uic`` is required for Bulgarian contacts only; see :data:`BG_UIC_LENGTHS`.
+    """
+    unknown = [t for t in types if t not in CONTACT_TYPES]
+    if unknown:
+        raise EfirmaError(
+            f"unknown contact type {unknown[0]!r}; "
+            f"choose from {', '.join(CONTACT_TYPES)}"
+        )
+    if not types:
+        raise EfirmaError("a contact needs at least one type")
+    if address_locale.upper() not in ("BG", "EN"):
+        raise EfirmaError(f"address locale must be BG or EN, not {address_locale!r}")
+
+    # The server validates this too, but its message is a bare "Invalid
+    # input" with no hint that case matters — and lowercase is the obvious
+    # thing to type.
+    if len(country_code) != 2 or not country_code.isalpha():
+        raise EfirmaError(
+            "country code must be an ISO 3166-1 alpha-2 code "
+            f"(BG, GB, DE), not {country_code!r}"
+        )
+    country_code = country_code.upper()
+
+    # Conditional, and easy to miss: the server only demands an identifier
+    # for Bulgarian contacts, and its complaint is an unexplained
+    # "uic: Invalid input".
+    if country_code == "BG":
+        if not uic:
+            raise EfirmaError(
+                "a Bulgarian contact needs --uic: an EIK (9 digits), "
+                "an ЕГН (10) or a branch EIK (13)"
+            )
+        if not uic.isdigit() or len(uic) not in BG_UIC_LENGTHS:
+            raise EfirmaError(
+                f"uic {uic!r} is not a valid Bulgarian identifier: expected "
+                f"{', '.join(str(n) for n in BG_UIC_LENGTHS)} digits"
+            )
+
+    suffix = address_locale.lower()
+    address = {
+        f"city_{suffix}": city,
+        f"line1_{suffix}": line1,
+        f"line2_{suffix}": line2,
+        f"state_{suffix}": state,
+        f"municipality_{suffix}": municipality,
+        "postalCode": postal_code,
+        "phone": phone,
+        f"attention_{suffix}": attention,
+        "country": country_code,
+    }
+    settings = {"locale": locale, "vatNonChargeReasonId": vat_non_charge_reason_id}
+    payload: dict[str, Any] = {
+        "type": list(types),
+        "name": name,
+        "email": email,
+        "countryCode": country_code,
+        "defaultCurrencyCode": currency_code,
+        # Drop the keys we have nothing for: both objects are required but
+        # each of their fields is optional, so `{}` is the empty case.
+        "address": {k: v for k, v in address.items() if v is not None},
+        "settings": {k: v for k, v in settings.items() if v is not None},
+    }
+    for key, value in (("uic", uic), ("vat", vat), ("notes", notes)):
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def build_item_payload(
+    *,
+    name_bg: str,
+    unit_price: float,
+    unit_id: str,
+    account_id: str,
+    name_en: str | None = None,
+    active: bool = True,
+) -> dict[str, Any]:
+    """Assemble a catalog-item payload. Pure function — no network.
+
+    Four fields are required: ``name_bg``, ``unitPrice``, and the ``unitId`` /
+    ``accountId`` references. ``name_en`` is optional and defaults to the
+    Bulgarian name, because an item with a blank English name renders as an
+    empty cell everywhere ``--locale EN`` is used.
+
+    The references are checked in a second pass *after* the schema validates,
+    and a bad id comes back as ``reference_not_found``, not a Zod error.
+    """
+    if unit_price < 0:
+        raise EfirmaError(f"unit price cannot be negative: {unit_price}")
+    return {
+        "name_bg": name_bg,
+        "name_en": name_en if name_en is not None else name_bg,
+        "unitPrice": unit_price,
+        "unitId": unit_id,
+        "accountId": account_id,
+        "active": active,
+    }
 
 
 def build_line_item(
@@ -744,6 +933,20 @@ class EfirmaClient:
     def items(self, company_id: str, **params: Any) -> dict[str, Any]:
         """One page of catalog items."""
         return self.get(f"/companies/{company_id}/items", **params)
+
+    def create_contact(
+        self, company_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create a contact. Build the payload with :func:`build_contact_payload`.
+
+        Unlike an invoice this isn't a numbered accounting document, so it can
+        be edited or deleted afterwards — but it is still real company data.
+        """
+        return self.post(f"/companies/{company_id}/contacts", payload)
+
+    def create_item(self, company_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a catalog item. Build it with :func:`build_item_payload`."""
+        return self.post(f"/companies/{company_id}/items", payload)
 
     # -- invoices ----------------------------------------------------------
 

@@ -56,6 +56,15 @@ built: expenses, contacts/items CRUD, banking.
   `data.code == "invalid_access_token"`, then retry **once**. Any other 401, or
   a failed refresh, means the session is gone — don't loop. `client.py` mirrors
   the bundle's `_isRetry` guard.
+- **Contacts break the bilingual rule** — a contact has a plain `name`, while
+  its *address* is bilingual (`city_bg`/`city_en`, and the street is
+  `line1_bg`/`line1_en`, not `street`). Items are normal: `name_bg`/`name_en`.
+- **`uic` is required on a contact only when `countryCode == "BG"`**, and must
+  be 9, 10 or 13 digits (EIK / ЕГН / branch EIK), no checksum. The server says
+  only `uic: Invalid input`, so `build_contact_payload()` explains it locally.
+- **Validation errors arrive in two envelopes:** Zod issues as a JSON *string*
+  in `message`, reference failures in `data.issues` with
+  `code == "reference_not_found"`. `EfirmaError` parses both.
 - **Token lifetimes:** access token ~24 h (cookie `maxAge` 86 400), refresh
   token ~1 year (31 536 000). So a stored session stays usable for a long time —
   which is exactly why `~/.efirma/session.json` is written `0600`.
@@ -149,7 +158,16 @@ efirma-cli/
   be unit-tested without spawning a subprocess.
 - **Probe a new endpoint with the Zod oracle before coding it**, and record what
   you learn in `docs/efirma-api-notes.md` — move the item out of "Open questions"
-  and mark the section ✅ confirmed.
+  and mark the section ✅ confirmed. Two traps, both of which have already
+  produced wrong conclusions in this repo:
+  - **Unknown keys are silently stripped**, so a guessed field name looks
+    accepted. Send the *wrong type* (`{"phone": 1}`) — real fields complain,
+    imaginary ones vanish. Sweep a candidate list to enumerate a schema.
+  - **A poison-pill field masks conditional rules.** Keeping one field invalid
+    is the right way to probe a create endpoint without creating anything, but
+    refinements depending on another field won't run while that field fails.
+    Move the pill to a different field and re-probe before believing a payload
+    is complete.
 - Never commit secrets (tokens, passwords). Read them from environment
   variables and document the names in the README. `~/.efirma/session.json`
   holds live JWTs — keep it `0600` and never log token values.
@@ -167,6 +185,12 @@ prompts: `users invite` (sends email) and `invoices create` (issues a
 sequentially-numbered accounting document). Both support `--yes` for scripting
 and `invoices create` has `--dry-run`; never make skipping confirmation the
 default, and never issue a test invoice against a live company.
+
+`contacts create` and `items create` deliberately **don't** prompt. They write
+ordinary company data that can be edited or deleted afterwards — not a numbered
+document, no email — and adding prompts everywhere is exactly the process this
+project does without. Both have `--dry-run`. Keep that line where it is: a
+prompt is for things you can't take back.
 
 ## Workflow — keep it simple
 

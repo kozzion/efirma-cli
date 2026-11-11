@@ -128,14 +128,33 @@ Every failure, same shape:
 }
 ```
 
-Validation failures replace `data` with the raw Zod error:
+Validation failures come in **two** shapes and you will meet both.
+
+**1. Schema (Zod) errors** — current builds serialise the raw `ZodError` array
+into `message` as a **JSON string**, which is easy to mistake for a plain
+sentence:
 
 ```json
 { "statusCode": 400, "statusMessage": "Validation Error",
-  "data": { "name": "ZodError", "issues": [
-    { "code": "invalid_type", "expected": "string", "received": "undefined",
-      "path": ["email"], "message": "Required" } ] } }
+  "message": "[\n  {\n    \"expected\": \"string\",\n    \"code\": \"invalid_type\",\n    \"path\": [\"name\"] ... }]" }
 ```
+
+Older builds put the same array in `data.issues` with `data.name == "ZodError"`.
+`client.py` reads both. Union fields nest their branches under `errors`, and the
+parent issue only ever says `"Invalid input"` — the branches are the informative
+part, so the client reports those instead.
+
+**2. Reference checks** run *after* the schema passes and still use the older
+envelope, with `data.code == "reference_not_found"`:
+
+```json
+{ "statusCode": 400, "data": { "code": "reference_not_found", "issues": [
+    { "code": "custom", "path": ["unitId"],
+      "message": "Not found in this company" } ] } }
+```
+
+That ordering is useful: a payload that gets as far as `reference_not_found`
+is schema-valid, and nothing was written.
 
 ### 🔑 The Zod errors are a free schema oracle
 
@@ -152,6 +171,26 @@ curl -sS -X POST -H 'Content-Type: application/json' -d '{}' \
 **Use this to map request bodies before writing any code for an endpoint.** It
 needs no auth for the `/auth/*` routes; for company routes it needs a session,
 but it still beats guessing.
+
+Two refinements of the technique, both learned the hard way:
+
+**Unknown keys are silently stripped, so a wrong guess looks like success.**
+Send a deliberately *wrong type* instead — `{"phone": 1}`. A real field
+complains "expected string, received number"; an imaginary one is dropped
+without comment. Sweeping a candidate list with a number, then a string, then a
+boolean enumerates the whole schema. That is how the contact and item payloads
+below were mapped, and it corrected an earlier conclusion: `uic` and `vat`
+*are* contact fields — they had merely passed validation when sent as valid
+strings, which looked identical to being ignored.
+
+**⚠️ A deliberately-invalid field can mask conditional rules.** To probe a
+create endpoint without creating anything, the obvious trick is to keep one
+field invalid as a poison pill. But refinements that depend on another field
+don't run while that field is failing: with `type: ["NOPE"]` the contact
+schema never reported the Bulgaria-only `uic` requirement, and it only
+appeared once `type` was valid and `email` was the poison instead. If a
+payload validates in probing but fails for real, suspect a refinement your
+pill was hiding — and move the pill to a different field to check.
 
 ## Endpoint catalog
 
@@ -372,7 +411,8 @@ Each `lineItems[]` element requires **all** of:
 So a line cannot be written free-hand: it must point at a **catalog item**, a
 **unit** and a **chart-of-accounts entry**. A fresh company ships with 11 units
 and 44 accounts but **zero items and zero contacts**, so both have to exist
-before any invoice can be issued.
+before any invoice can be issued. Both are creatable through the API — the
+payloads are below.
 
 ⚠️ **Not verified end-to-end.** The field list and enums above come from the
 server's own validation errors, which is authoritative for *shape*. A complete
@@ -381,6 +421,66 @@ the series' `nextNumber`, whether the server re-derives `displayNumber`, and
 whether issuing advances `nextNumber` automatically — are still unconfirmed.
 `display_number()` in `client.py` is likewise **inferred** (ten digits, prefix
 included) from the numbering series' shape, not from a real invoice.
+
+### `POST /companies/{id}/contacts` — create a contact (✅ confirmed)
+
+Seven required keys, though three of them tolerate a blank value:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `type` | array | one or both of `CUSTOMER`, `SUPPLIER` |
+| `name` | string | **plain `name`** — contacts are the one exception to the bilingual rule |
+| `email` | string | a valid address, **or exactly `""`**. It is a union, so omitting it fails |
+| `countryCode` | string | ISO 3166-1 alpha-2, **uppercase**. `bg` and `BGR` are rejected |
+| `defaultCurrencyCode` | string | **not validated at all** — `XYZ` is accepted |
+| `address` | object | required, but `{}` is fine |
+| `settings` | object | required, but `{}` is fine |
+
+Optional top-level: `uic`, `vat`, `notes` (all strings).
+
+`address` (every field optional, bilingual where you'd least expect):
+`country` (alpha-2 uppercase, same rule), `city_bg`/`city_en`,
+`line1_bg`/`line1_en` (**the street** — there is no `street` key),
+`line2_bg`/`line2_en`, `state_bg`/`state_en`,
+`municipality_bg`/`municipality_en`, `postalCode`, `phone`,
+`attention_bg`/`attention_en`.
+
+`settings` (both optional): `locale` (`BG`|`EN`), `vatNonChargeReasonId` (uuid).
+
+**🔑 `uic` is conditionally required: Bulgarian contacts only.** When
+`countryCode == "BG"` it must be present and **9, 10 or 13 digits** — 9 is an
+EIK, 10 an ЕГН (a person or sole trader), 13 a branch EIK. Digits only, and
+there is **no checksum**: `999999999` validates. Any other country doesn't need
+one. The server's complaint is a bare `uic: Invalid input` that never mentions
+Bulgaria, so `build_contact_payload()` checks it locally and says why.
+
+```json
+{ "type": ["CUSTOMER"], "name": "Example Ltd", "email": "",
+  "countryCode": "GB", "defaultCurrencyCode": "GBP",
+  "address": { "country": "GB", "city_en": "London",
+               "line1_en": "1 Example Street", "postalCode": "EC1A 1BB" },
+  "settings": { "locale": "EN" } }
+```
+
+### `POST /companies/{id}/items` — create a catalog item (✅ confirmed)
+
+Refreshingly small. Four required, two optional:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `name_bg` | string | required — bilingual here, unlike contacts |
+| `unitPrice` | number | required, excluding VAT |
+| `unitId` | uuid | required, must exist in this company |
+| `accountId` | uuid | required, must exist in this company |
+| `name_en` | string | optional; blank renders as an empty cell under `--locale EN` |
+| `active` | boolean | optional — note `active`, **not** `isActive` |
+
+No `vatRate`, `code`, `description` or `currencyCode`: all stripped. The VAT
+rate lives on the invoice *line*, not the item.
+
+The two uuids are checked after the schema passes, so a bad one returns
+`reference_not_found` rather than a Zod issue — and writes nothing, which makes
+it a safe way to test a payload.
 
 ## Numbering
 
@@ -453,9 +553,18 @@ PDF endpoints return a binary body, and the real filename is in the
       ones — no `isDefault`/`isSystem` flag is visible on the role objects.
 - [ ] Rate limiting / Cloudflare behaviour under scripted use. Nothing has
       challenged plain `httpx` so far.
+- [ ] Whether `defaultCurrencyCode` on a contact is validated anywhere later.
+      The create endpoint accepts `"XYZ"` without complaint, which smells like
+      a missing check rather than an intended freedom.
+- [ ] What `settings.vatNonChargeReasonId` on a *contact* does — presumably a
+      default applied to that contact's invoices, but unconfirmed.
 
 ### Settled
 
+- [x] **Contact and item create payloads** — both mapped and in *Write
+      payloads* above, including the Bulgaria-only `uic` rule.
+- [x] **Auth moved to cookies** (2025) — login answers 204, refresh reads its
+      token from a cookie only. See *Auth*.
 - [x] **Collections come in two shapes** — bare arrays for reference data,
       paginated envelopes for documents. See *Pagination* above. `unwrap()`
       handles both.
