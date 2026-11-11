@@ -435,12 +435,69 @@ elsewhere avoids restarting at 1: `PUT /companies/{id}/numberings` with
 `{"documentType": "INVOICE", "numberings": [{id, prefix, nextNumber, year,
 isActive}]}` — collection-level, not per-id, and there is no `PATCH` or `POST`.
 
-⚠️ What is **not** reversible is the document itself: there is no `/void` route
-and no `DELETE`. The only remedy for a wrong invoice is
-`PUT /companies/{id}/invoices/{invoiceId}` with the full corrected payload,
-which keeps the number and dates. Render the PDF after issuing and actually
-read it — the minor-units trap above produced a schema-valid invoice with the
-wrong total, and nothing but the PDF said so.
+### Undoing one
+
+Two routes, both confirmed on `0000000029`:
+
+| | |
+| --- | --- |
+| `PUT /companies/{id}/invoices/{invoiceId}` | Full corrected payload, same shape as the create. Keeps the number, dates and id. No `PATCH`. |
+| `DELETE /companies/{id}/invoices/{invoiceId}` | Removes it, **and decrements `nextNumber`** — 30 → 29. Re-issuing then reuses 29, so there is no gap. |
+
+There is no `/void`, `/cancel` or `/storno` route — `VOID` is only a `status`
+value you can `PUT`. A `DELETE` against a company you can see but an id that
+does not exist answers a real JSON 404 (`Invoice with id ... not found for
+company id ...`), which is the safe way to confirm the route exists without
+destroying anything.
+
+Which to use is a bookkeeping question, not a technical one: `DELETE` while the
+invoice is still unsent, `PUT` once it has gone out, and a **credit note** once
+it has actually been booked — Bulgarian practice corrects a delivered invoice
+with a кредитно известие referencing it, rather than altering or erasing it.
+The UI has `revenues/credit-notes`; this client does not implement them yet.
+
+⚠️ Whichever you use, **render the PDF afterwards and read it.** The minor-units
+trap above produced a schema-valid invoice with the wrong total, and nothing
+but the PDF said so.
+
+### Issuing one, start to finish (✅ run 11 Nov 2026)
+
+A fresh company cannot issue anything: it ships with 11 units and 44 accounts
+but **zero contacts and zero items**, and every line needs one of each. The
+whole sequence, in order, with the parts that are not guessable:
+
+1. **Reference data.** `GET .../vat-non-charge-reasons?isVatRegistered=true`,
+   `.../units`, `.../accounts`, `.../bank-accounts`, `.../numberings`.
+   For services to a non-BG business the reason is **`ART21`** ("услугата е
+   извън територията на България") — that is the reverse-charge ground, and
+   with it the line's `vatRate` is `0`.
+   The revenue account for services is `Продажба на услуги` / `Sale of
+   services`; the accounts list is a flat chart with **no `code` field**, so
+   match on the name.
+2. **Contact** — `POST .../contacts`. `uic` is only *required* for `BG`
+   contacts but is *accepted* for any country, and it is what prints on the
+   invoice, so put a foreign company number there (a UK company number renders
+   as `UIC: 17111866`). `email` must be present and may be `""`.
+   `settings.vatNonChargeReasonId` makes the reason stick per customer.
+3. **Item** — `POST .../items`. `unitPrice` in minor units (see above).
+4. **Numbering, if the company is already mid-sequence elsewhere.** A new
+   company starts at `nextNumber: 1`, which would open a second parallel
+   sequence next to invoices raised outside efirma. Move it first with
+   `PUT .../numberings` (collection-level; see Numbering).
+5. **Issue** — `POST .../invoices`. `displayNumber` is sent by the client and
+   used verbatim (ten digits, prefix included); `number` is taken as given; and
+   the series **advances itself**, no second call.
+6. **Read the PDF.** `GET .../invoices/{id}/pdf`. This is the only place the
+   units mistake is visible.
+
+Currency is free — `GBP` on a company whose `baseCurrencyCode` is `EUR` is
+accepted and renders `£`. But the **bank account printed on the invoice carries
+its own `currencyCode`**, and nothing warns you when they disagree: a GBP
+invoice will happily print a EUR IBAN. Register a matching bank account first
+if that matters.
+
+The web-app URL for the result is in **Web-app URLs** above — it is not
+`/invoices/{id}`.
 
 ### `POST /companies/{id}/contacts` — create a contact (✅ confirmed)
 

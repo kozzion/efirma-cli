@@ -65,11 +65,18 @@ issued invoice in place). Not yet built: expenses, banking.
   `to_vat_fraction()` in `client.py` are the only place this conversion
   happens; keep every payload going through `build_line_item` /
   `build_item_payload` and never hand-write a price into a payload dict.
-- **An issued invoice can be corrected in place.** `PUT /companies/{id}/
-  invoices/{invoiceId}` takes the same full payload as the create and keeps the
-  number and dates — there is no `PATCH`, and no `/void` route. That is the
-  remedy when a wrong invoice is already numbered, rather than voiding and
-  burning a number.
+- **A wrong invoice has two remedies, and both work.** `PUT /companies/{id}/
+  invoices/{invoiceId}` takes the same full payload as the create and corrects
+  the document in place, keeping its number and dates (there is no `PATCH`).
+  `DELETE` on the same path removes it outright **and winds `nextNumber` back**,
+  so deleting the newest invoice and re-issuing leaves no gap in the sequence —
+  verified on `0000000029`: 30 → 29 on delete, 29 → 30 again on re-issue.
+  There is no `/void`, `/cancel` or `/storno` route; `VOID` is only a `status`
+  value you `PUT`.
+  Prefer `PUT` once a document has left the building, and `DELETE` only while
+  it is still unsent — a deleted invoice is gone, and Bulgarian bookkeeping
+  expects an issued-and-delivered invoice to be corrected by a **credit note**
+  (`revenues/credit-notes` exists in the UI; not built here yet), not erased.
 - **Contacts break the bilingual rule** — a contact has a plain `name`, while
   its *address* is bilingual (`city_bg`/`city_en`, and the street is
   `line1_bg`/`line1_en`, not `street`). Items are normal: `name_bg`/`name_en`.

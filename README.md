@@ -130,9 +130,10 @@ creating the document; `--yes` skips the prompt for scripting.
 > format and series behaviour are confirmed. But prices cross the wire in minor
 > units and VAT as a 0..1 fraction, so a payload built by hand rather than
 > through `build_line_item` can be schema-valid and still issue the wrong
-> amount — that exact mistake issued EUR 5,984.80 as EUR 59.85. There is no
-> void and no delete; `invoices create` can only be undone by a `PUT` that
-> corrects the same document in place.
+> amount — that exact mistake issued EUR 5,984.80 as EUR 59.85. A wrong
+> invoice can be corrected with a `PUT` to the same id, or deleted outright —
+> deleting the newest one also winds the numbering back, so re-issuing leaves
+> no gap.
 
 ## Configuration
 
