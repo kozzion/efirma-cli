@@ -125,10 +125,14 @@ poetry run efirma invoices create --from invoice.json --dry-run
 issues nothing. Drop it and the command shows the same summary and asks before
 creating the document; `--yes` skips the prompt for scripting.
 
-> ⚠️ **Issuing has never been run end-to-end.** The payload schema is confirmed
-> against the server's own validation, but no invoice has actually been created
-> through this client. The invoice number format in particular is *inferred* —
-> check the first one against the web app. Always `--dry-run` first.
+> ⚠️ **Issuing is irreversible — always `--dry-run` first, then read the PDF.**
+> It has been run end-to-end (invoice `0000000029`, 11 Nov 2026) and the number
+> format and series behaviour are confirmed. But prices cross the wire in minor
+> units and VAT as a 0..1 fraction, so a payload built by hand rather than
+> through `build_line_item` can be schema-valid and still issue the wrong
+> amount — that exact mistake issued EUR 5,984.80 as EUR 59.85. There is no
+> void and no delete; `invoices create` can only be undone by a `PUT` that
+> corrects the same document in place.
 
 ## Configuration
 

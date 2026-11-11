@@ -28,6 +28,7 @@ from efirma_cli.client import (
     build_item_payload,
     build_line_item,
     default_session_path,
+    from_minor,
     invoice_total,
     localized,
     unwrap,
@@ -94,8 +95,9 @@ LineOpt = typer.Option(
     None,
     "--line",
     "-l",
-    help="Line as 'name:qty:unitPrice:vatRate', repeatable. "
-    "Needs --item/--unit/--account for the references.",
+    help="Line as 'name:qty:unitPrice:vatRate', repeatable. Price in whole "
+    "currency (5984.80, not cents) and VAT as a percent (20, not 0.2) — "
+    "both are converted for you. Needs --item/--unit/--account.",
 )
 
 
@@ -461,7 +463,8 @@ def invoices_list(
     table.add_column("ID", style="dim")
     for inv in rows:
         contact = inv.get("contact") or {}
-        total = inv.get("totalAmount") or inv.get("total") or ""
+        raw_total = inv.get("totalAmount") or inv.get("total")
+        total = f"{from_minor(raw_total):,.2f}" if raw_total is not None else ""
         table.add_row(
             str(inv.get("displayNumber", "")),
             str(inv.get("issueDate", ""))[:10],
@@ -823,7 +826,7 @@ def items_list(
     for row in rows:
         table.add_row(
             localized(row, locale=locale),
-            f"{row.get('unitPrice', 0):,.2f}",
+            f"{from_minor(row.get('unitPrice')):,.2f}",
             localized(row.get("unit") or {}, locale=locale),
             localized(row.get("account") or {}, locale=locale),
             "✓" if row.get("active") else "",

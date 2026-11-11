@@ -28,6 +28,7 @@ import json
 import os
 from collections.abc import Sequence
 from datetime import date, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -411,6 +412,77 @@ def build_contact_payload(
     return payload
 
 
+# -- money and rates -------------------------------------------------------
+#
+# The API does NOT speak in the units a human types, and neither mismatch is
+# announced anywhere: a wrong value is accepted and silently renders a wrong
+# document. Both were found the hard way, on a real issued invoice.
+#
+#   unitPrice  integer MINOR units (cents). `5984.80` was stored as 5,984.8
+#              cents and the PDF came out at EUR 59.85 — a factor of 100.
+#   vatRate    a FRACTION, 0..1, not a percentage. The server's Zod schema
+#              caps it at 1, so `20` for 20% is at least a loud 400 ("Too
+#              big: expected number to be <=1") — but `0.2` meant as "0.2%"
+#              quietly becomes 20%.
+#
+# Everything crossing into a payload goes through these two functions, so the
+# library's own surface stays in the units a person actually means: major
+# units for money, percent for VAT.
+
+MINOR_UNITS = 100
+
+
+def to_minor(amount: float | int | str | Decimal, *, field: str = "amount") -> int:
+    """Major units (``5984.80``) to the integer minor units the API stores.
+
+    Rounds half-up to the nearest minor unit, which is ordinary money
+    behaviour — ``5000 / 0.83545`` is ``5984.7986...`` and belongs on an
+    invoice as ``5984.80``. Goes through :class:`~decimal.Decimal` because
+    ``5984.80 * 100`` is ``598479.9999...`` in binary floating point, and
+    ``int()`` on that silently loses a cent.
+
+    >>> to_minor(5984.80)
+    598480
+    >>> to_minor(0)
+    0
+    """
+    try:
+        value = Decimal(str(amount))
+    except Exception as exc:  # noqa: BLE001 - re-raised as our own error type
+        raise EfirmaError(f"{field} is not a number: {amount!r}") from exc
+    if value < 0:
+        raise EfirmaError(f"{field} cannot be negative: {amount}")
+    return int((value * MINOR_UNITS).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def from_minor(amount: float | int | None) -> float:
+    """Minor units back to major, for showing a server value to a person.
+
+    >>> from_minor(598480)
+    5984.8
+    """
+    return (amount or 0) / MINOR_UNITS
+
+
+def to_vat_fraction(percent: float | int | str | Decimal) -> float:
+    """A VAT percentage (``20``) to the 0..1 fraction the API wants (``0.2``).
+
+    >>> to_vat_fraction(20)
+    0.2
+    >>> to_vat_fraction(0)
+    0.0
+    """
+    try:
+        value = Decimal(str(percent))
+    except Exception as exc:  # noqa: BLE001 - re-raised as our own error type
+        raise EfirmaError(f"VAT rate is not a number: {percent!r}") from exc
+    if not 0 <= value <= 100:
+        raise EfirmaError(
+            f"VAT rate must be a percentage between 0 and 100, not {percent!r}"
+        )
+    return float(value / 100)
+
+
 def build_item_payload(
     *,
     name_bg: str,
@@ -429,13 +501,14 @@ def build_item_payload(
 
     The references are checked in a second pass *after* the schema validates,
     and a bad id comes back as ``reference_not_found``, not a Zod error.
+
+    ``unit_price`` is in **major units** — euros, not cents. See
+    :func:`to_minor` for why that conversion cannot be skipped.
     """
-    if unit_price < 0:
-        raise EfirmaError(f"unit price cannot be negative: {unit_price}")
     return {
         "name_bg": name_bg,
         "name_en": name_en if name_en is not None else name_bg,
-        "unitPrice": unit_price,
+        "unitPrice": to_minor(unit_price, field="unit price"),
         "unitId": unit_id,
         "accountId": account_id,
         "active": active,
@@ -458,13 +531,18 @@ def build_line_item(
     Every one of these is mandatory — including the three references
     (``itemId``, ``unitId``, ``accountId``), so a line can't be written
     free-hand without a catalog item, a unit and a chart-of-accounts entry.
+
+    Both numbers are given the way a person says them and converted here:
+    ``unit_price`` in **major units** (euros) and ``vat_rate`` as a
+    **percentage** (``20`` for 20%). See :func:`to_minor` for what the server
+    actually stores, and why guessing wrong is silent.
     """
     return {
         "name_bg": name_bg,
         "name_en": name_en,
         "quantity": quantity,
-        "unitPrice": unit_price,
-        "vatRate": vat_rate,
+        "unitPrice": to_minor(unit_price, field="unit price"),
+        "vatRate": to_vat_fraction(vat_rate),
         "itemId": item_id,
         "unitId": unit_id,
         "accountId": account_id,
@@ -539,10 +617,19 @@ def build_invoice_payload(
 
 
 def invoice_total(payload: dict[str, Any]) -> tuple[float, float]:
-    """``(net, gross)`` for a payload's lines, for showing before issuing."""
-    net = sum(li["quantity"] * li["unitPrice"] for li in payload["lineItems"])
+    """``(net, gross)`` for a payload's lines, for showing before issuing.
+
+    Returns **major** units, because this exists to be read by a person. The
+    payload itself holds minor units and 0..1 VAT rates, which is exactly the
+    discrepancy that made an earlier preview say ``5,984.80`` over a payload
+    that issued at EUR 59.85 — so this must stay in step with
+    :func:`build_line_item`.
+    """
+    net = sum(
+        li["quantity"] * from_minor(li["unitPrice"]) for li in payload["lineItems"]
+    )
     gross = sum(
-        li["quantity"] * li["unitPrice"] * (1 + li.get("vatRate", 0) / 100)
+        li["quantity"] * from_minor(li["unitPrice"]) * (1 + li.get("vatRate", 0))
         for li in payload["lineItems"]
     )
     return net, gross

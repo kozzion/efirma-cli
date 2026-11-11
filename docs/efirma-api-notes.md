@@ -404,9 +404,19 @@ sending `null` is not.
 Each `lineItems[]` element requires **all** of:
 
 ```json
-{ "name_bg": "...", "name_en": "...", "quantity": 1, "unitPrice": 100,
-  "vatRate": 20, "itemId": "<uuid>", "unitId": "<uuid>", "accountId": "<uuid>" }
+{ "name_bg": "...", "name_en": "...", "quantity": 1, "unitPrice": 10000,
+  "vatRate": 0.2, "itemId": "<uuid>", "unitId": "<uuid>", "accountId": "<uuid>" }
 ```
+
+**Read those two numbers again — neither is in the unit you would guess.**
+`unitPrice` is in **minor units** (that line is EUR 100.00, not 10,000) and
+`vatRate` is a **fraction**, not a percent (that line is 20%). Both were found
+on a real issued invoice: `5984.80` was taken as 5,984.8 cents and the PDF came
+out at **EUR 59.85**. `vatRate` at least fails loudly — the schema caps it at 1,
+so `20` answers `Too big: expected number to be <=1` — but `0.2` written meaning
+"0.2%" is quietly 20%. `client.py` converts both at the boundary
+(`to_minor` / `to_vat_fraction`), so the library's own surface takes euros and
+percents; anything bypassing those builders must convert for itself.
 
 So a line cannot be written free-hand: it must point at a **catalog item**, a
 **unit** and a **chart-of-accounts entry**. A fresh company ships with 11 units
@@ -414,13 +424,23 @@ and 44 accounts but **zero items and zero contacts**, so both have to exist
 before any invoice can be issued. Both are creatable through the API — the
 payloads are below.
 
-⚠️ **Not verified end-to-end.** The field list and enums above come from the
-server's own validation errors, which is authoritative for *shape*. A complete
-payload has never been posted, so the semantics — whether `number` must equal
-the series' `nextNumber`, whether the server re-derives `displayNumber`, and
-whether issuing advances `nextNumber` automatically — are still unconfirmed.
-`display_number()` in `client.py` is likewise **inferred** (ten digits, prefix
-included) from the numbering series' shape, not from a real invoice.
+✅ **Verified end-to-end** on 11 Nov 2026, issuing invoice `0000000029`. The
+open semantics are now settled: `displayNumber` is sent by the client and used
+verbatim (ten digits, prefix included — `display_number()` was right), `number`
+is taken as given, and **issuing advances the series itself** (`nextNumber`
+went 29 → 30 with no extra call).
+
+The series can be moved first, which is how a company already mid-sequence
+elsewhere avoids restarting at 1: `PUT /companies/{id}/numberings` with
+`{"documentType": "INVOICE", "numberings": [{id, prefix, nextNumber, year,
+isActive}]}` — collection-level, not per-id, and there is no `PATCH` or `POST`.
+
+⚠️ What is **not** reversible is the document itself: there is no `/void` route
+and no `DELETE`. The only remedy for a wrong invoice is
+`PUT /companies/{id}/invoices/{invoiceId}` with the full corrected payload,
+which keeps the number and dates. Render the PDF after issuing and actually
+read it — the minor-units trap above produced a schema-valid invoice with the
+wrong total, and nothing but the PDF said so.
 
 ### `POST /companies/{id}/contacts` — create a contact (✅ confirmed)
 
@@ -469,7 +489,7 @@ Refreshingly small. Four required, two optional:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `name_bg` | string | required — bilingual here, unlike contacts |
-| `unitPrice` | number | required, excluding VAT |
+| `unitPrice` | integer | required, excluding VAT, in **minor units** — 15000 is EUR 150.00 |
 | `unitId` | uuid | required, must exist in this company |
 | `accountId` | uuid | required, must exist in this company |
 | `name_en` | string | optional; blank renders as an empty cell under `--locale EN` |

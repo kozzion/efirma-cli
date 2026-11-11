@@ -21,9 +21,10 @@ endpoints are confirmed.
 Working today, verified against a live account: login/refresh/logout, `/me`,
 company listing and resolution, the full `settings/users` surface (list, invite,
 set-role, remove, cancel-invite, roles) and invoice **reading** (list, show,
-pdf, refs). Invoice **issuing** is built and its payload schema is confirmed,
-but it has never been run end-to-end — see the warning in the notes. Not yet
-built: expenses, contacts/items CRUD, banking.
+pdf, refs), contacts/items **create**, and invoice **issuing** — run
+end-to-end on 11 Nov 2026 (invoice `0000000029`, confirming the ten-digit
+`displayNumber`, that the series advances itself, and that `PUT` corrects an
+issued invoice in place). Not yet built: expenses, banking.
 
 ## API quirks (learned the hard way)
 
@@ -56,6 +57,19 @@ built: expenses, contacts/items CRUD, banking.
   `data.code == "invalid_access_token"`, then retry **once**. Any other 401, or
   a failed refresh, means the session is gone — don't loop. `client.py` mirrors
   the bundle's `_isRetry` guard.
+- **🔑 Money is in minor units and VAT is a fraction.** `unitPrice` is an
+  integer count of cents (`598480` = EUR 5,984.80) and `vatRate` is `0..1`
+  (`0.2` = 20%), on both invoice lines and catalog items. Nothing in the API
+  says so and a wrong price is **accepted silently** — EUR 5,984.80 was issued
+  as EUR 59.85 before anyone noticed, on a numbered document. `to_minor()` /
+  `to_vat_fraction()` in `client.py` are the only place this conversion
+  happens; keep every payload going through `build_line_item` /
+  `build_item_payload` and never hand-write a price into a payload dict.
+- **An issued invoice can be corrected in place.** `PUT /companies/{id}/
+  invoices/{invoiceId}` takes the same full payload as the create and keeps the
+  number and dates — there is no `PATCH`, and no `/void` route. That is the
+  remedy when a wrong invoice is already numbered, rather than voiding and
+  burning a number.
 - **Contacts break the bilingual rule** — a contact has a plain `name`, while
   its *address* is bilingual (`city_bg`/`city_en`, and the street is
   `line1_bg`/`line1_en`, not `street`). Items are normal: `name_bg`/`name_en`.

@@ -24,8 +24,11 @@ from efirma_cli.client import (
     company_matches,
     display_number,
     filename_from_headers,
+    from_minor,
     invoice_total,
     localized,
+    to_minor,
+    to_vat_fraction,
     unwrap,
 )
 
@@ -471,6 +474,18 @@ def test_display_number_pads_to_ten_digits_including_prefix():
 # -- invoice payload ------------------------------------------------------
 
 
+_LINE_KW = dict(
+    name_bg="Консултация",
+    name_en="Consulting",
+    quantity=10,
+    unit_price=120,
+    vat_rate=20,
+    item_id="i1",
+    unit_id="u1",
+    account_id="a1",
+)
+
+
 def _line(**over):
     base = dict(
         name_bg="Консултация",
@@ -830,11 +845,74 @@ def test_item_payload_defaults_english_name_to_the_bulgarian_one():
     assert payload == {
         "name_bg": "Консултация",
         "name_en": "Консултация",
-        "unitPrice": 150.0,
+        "unitPrice": 15000,
         "unitId": "u-1",
         "accountId": "a-1",
         "active": True,
     }
+
+
+# -- money and rate units -------------------------------------------------
+#
+# The two conversions that an issued invoice got wrong in production: a
+# EUR 5,984.80 line that rendered as EUR 59.85, and a vatRate the server caps
+# at 1. Both are silent-ish, so they are pinned hard here.
+
+
+def test_unit_price_is_sent_in_minor_units():
+    assert build_line_item(**{**_LINE_KW, "unit_price": 5984.80})["unitPrice"] == 598480
+
+
+def test_minor_units_survive_binary_floating_point():
+    """``5984.80 * 100`` is 598479.9999... — int() on that loses a cent."""
+    assert to_minor(5984.80) == 598480
+    assert to_minor(0.07) == 7
+    assert to_minor(1.005) == 101  # half-up, not banker's rounding
+
+
+def test_a_fractional_minor_unit_rounds_half_up():
+    assert to_minor(5000 / 0.83545) == 598480
+
+
+def test_to_minor_and_from_minor_round_trip():
+    assert from_minor(to_minor(5984.80)) == pytest.approx(5984.80)
+
+
+def test_vat_is_given_as_a_percentage_and_sent_as_a_fraction():
+    assert build_line_item(**{**_LINE_KW, "vat_rate": 20})["vatRate"] == pytest.approx(
+        0.2
+    )
+    assert to_vat_fraction(0) == 0.0
+    assert to_vat_fraction(9) == pytest.approx(0.09)
+
+
+def test_a_vat_rate_above_100_is_refused_here_not_by_the_server():
+    with pytest.raises(EfirmaError, match="between 0 and 100"):
+        to_vat_fraction(2000)
+
+
+def test_negative_money_is_refused():
+    with pytest.raises(EfirmaError, match="negative"):
+        to_minor(-1, field="unit price")
+    with pytest.raises(EfirmaError, match="negative"):
+        build_item_payload(name_bg="x", unit_price=-1, unit_id="u", account_id="a")
+
+
+def test_invoice_total_reads_back_in_major_units():
+    """The preview a person confirms must match what the server renders."""
+    payload = build_invoice_payload(
+        contact_id="c1",
+        line_items=[
+            build_line_item(
+                **{**_LINE_KW, "quantity": 1, "unit_price": 5984.80, "vat_rate": 0}
+            )
+        ],
+        number=29,
+    )
+    assert payload["lineItems"][0]["unitPrice"] == 598480
+    net, gross = invoice_total(payload)
+    assert net == pytest.approx(5984.80)
+    assert gross == pytest.approx(5984.80)
 
 
 def test_item_rejects_a_negative_price():
