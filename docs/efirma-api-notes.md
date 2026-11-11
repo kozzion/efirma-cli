@@ -502,6 +502,25 @@ The two uuids are checked after the schema passes, so a bad one returns
 `reference_not_found` rather than a Zod issue — and writes nothing, which makes
 it a safe way to test a payload.
 
+## Web-app URLs (for linking a human at a record)
+
+The UI is **not** at the obvious path. Routes are nested under a
+`/:companySlug()` parent and grouped by ledger side, so an invoice is:
+
+```
+https://app.efirma.bg/{companySlug}/revenues/invoices/{invoiceId}
+```
+
+`companySlug` is the `slug` field on the company record from `/me` (e.g.
+`saut-rivur-ai-bulgariya-eood-207136649`) — not the uuid. Siblings under
+`revenues/`: `invoices`, `proforma-invoices`, `recurring-invoices`,
+`credit-notes`, `debit-notes`, each with `/new`, `/:id` and `/:id/edit`.
+
+Guessing this is a waste of time — the SPA answers **200 for every path**, so a
+wrong URL looks exactly like a right one until a human opens it. Read the route
+table out of the Nuxt chunks instead: `grep -o 'name:.companySlug[^`]*.,path:.[^`]*.'`
+over the files referenced from the app shell.
+
 ## Numbering
 
 ```
